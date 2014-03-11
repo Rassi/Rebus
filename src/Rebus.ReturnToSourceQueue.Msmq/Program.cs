@@ -12,6 +12,8 @@ namespace Rebus.ReturnToSourceQueue.Msmq
 {
     class Program
     {
+        const int BatchSize = 2000;
+
         static int Main(string[] args)
         {
             RebusLoggerFactory.Current = new NullLoggerFactory();
@@ -42,7 +44,7 @@ namespace Rebus.ReturnToSourceQueue.Msmq
         {
             if (!parameters.DryRun.HasValue && parameters.Interactive)
             {
-                var dryrun = PromptChar(new[] {'d', 'm'}, "Perform a (d)ry dun or actually (m) move messages?");
+                var dryrun = PromptChar(new[] { 'd', 'm' }, "Perform a (d)ry dun or actually (m) move messages?");
 
                 switch (dryrun)
                 {
@@ -61,13 +63,13 @@ namespace Rebus.ReturnToSourceQueue.Msmq
             if (string.IsNullOrWhiteSpace(parameters.ErrorQueueName))
             {
                 var errorQueueName = Prompt("Please type the name of an error queue");
-                
+
                 parameters.ErrorQueueName = errorQueueName;
             }
 
             if (!parameters.AutoMoveAllMessages.HasValue)
             {
-                var mode = PromptChar(new[] {'a', 'p'},
+                var mode = PromptChar(new[] { 'a', 'p' },
                                       "Move (a)ll messages back to their source queues or (p)rompt for each message");
 
                 switch (mode)
@@ -89,7 +91,7 @@ namespace Rebus.ReturnToSourceQueue.Msmq
 
         static Parameters ParseArgs(string[] args)
         {
-            if (args.Length == 0) return new Parameters {Interactive = true};
+            if (args.Length == 0) return new Parameters { Interactive = true };
 
             var parameters = new Parameters { Interactive = false };
 
@@ -114,7 +116,8 @@ namespace Rebus.ReturnToSourceQueue.Msmq
             var validArgs = new Dictionary<string, Action<Parameters>> 
                                 {
                                     {"--auto-move", p => p.AutoMoveAllMessages = true},
-                                    {"--dry", p => p.DryRun = true}
+                                    {"--dry", p => p.DryRun = true},
+                                    {"--noninteractive", p => p.Interactive = false}
                                 };
 
             foreach (var arg in theRestOfTheArguments)
@@ -217,34 +220,87 @@ in order to SIMULATE automatically processing all messages (queue transaction wi
                 throw new NiceException("Please specify the name of an error queue");
             }
 
-            using (var tx = new TransactionScope())
+            if (!MessageQueue.Exists(MsmqUtil.GetPath(parameters.ErrorQueueName)))
             {
-                var transactionContext = new AmbientTransactionContext();
+                throw new NiceException("The MSMQ queue '{0}' does not exist!", parameters.ErrorQueueName);
+            }
 
-                if (!MessageQueue.Exists(MsmqUtil.GetPath(parameters.ErrorQueueName)))
+            var msmqMessageQueue = new MsmqMessageQueue(parameters.ErrorQueueName, allowRemoteQueue: true);
+            Console.WriteLine("Reading messages from {0} (batches of {1})", parameters.ErrorQueueName, BatchSize);
+
+            do
+            {
+                using (var tx = new TransactionScope())
                 {
-                    throw new NiceException("The MSMQ queue '{0}' does not exist!", parameters.ErrorQueueName);
-                }
-
-                var msmqMessageQueue = new MsmqMessageQueue(parameters.ErrorQueueName, allowRemoteQueue: true);
-                var allTheMessages = GetAllTheMessages(msmqMessageQueue, transactionContext);
-
-                foreach (var message in allTheMessages)
-                {
-                    var transportMessageToSend = message.ToForwardableMessage();
-
-                    try
+                    var transactionContext = new AmbientTransactionContext();
+                    var messages = GetMessages(msmqMessageQueue, transactionContext);
+                    if (!messages.Any())
                     {
-                        if (!transportMessageToSend.Headers.ContainsKey(Headers.SourceQueue))
-                        {
-                            throw new NiceException(
-                                "Message {0} does not have a source queue header - it will be moved back to the input queue",
-                                message.Id);
-                        }
+                        break;
+                    }
+                    ReturnMessages(messages, parameters, msmqMessageQueue, transactionContext);
 
-                        var sourceQueue = (string)transportMessageToSend.Headers[Headers.SourceQueue];
+                    CommitTransaction(parameters, tx);
+                }
+            } while (true);
+        }
 
-                        if (parameters.AutoMoveAllMessages.GetValueOrDefault())
+        static void CommitTransaction(Parameters parameters, TransactionScope tx)
+        {
+            if (parameters.DryRun.GetValueOrDefault())
+            {
+                Print("Dry Run enabled. Not committing queue transaction");
+                return;
+            }
+
+            if (!parameters.Interactive)
+            {
+                tx.Complete();
+                return;
+            }
+
+            var commitAnswer = PromptChar(new[] { 'y', 'n' }, "Would you like to commit the queue transaction?");
+
+            if (commitAnswer == 'y')
+            {
+                Print("Committing queue transaction");
+
+                tx.Complete();
+                return;
+            }
+
+            Print("Queue transaction aborted");
+        }
+
+        static void ReturnMessages(IEnumerable<ReceivedTransportMessage> messages, Parameters parameters, MsmqMessageQueue msmqMessageQueue, AmbientTransactionContext transactionContext)
+        {
+            foreach (var message in messages)
+            {
+                var transportMessageToSend = message.ToForwardableMessage();
+
+                try
+                {
+                    if (!transportMessageToSend.Headers.ContainsKey(Headers.SourceQueue))
+                    {
+                        throw new NiceException(
+                            "Message {0} does not have a source queue header - it will be moved back to the input queue",
+                            message.Id);
+                    }
+
+                    var sourceQueue = (string)transportMessageToSend.Headers[Headers.SourceQueue];
+
+                    if (parameters.AutoMoveAllMessages.GetValueOrDefault())
+                    {
+                        msmqMessageQueue.Send(sourceQueue, transportMessageToSend, transactionContext);
+
+                        Print("Moved {0} to {1}", message.Id, sourceQueue);
+                    }
+                    else
+                    {
+                        var answer = PromptChar(new[] { 'y', 'n' }, "Would you like to move {0} to {1}? (y/n)",
+                                                message.Id, sourceQueue);
+
+                        if (answer == 'y')
                         {
                             msmqMessageQueue.Send(sourceQueue, transportMessageToSend, transactionContext);
 
@@ -252,69 +308,42 @@ in order to SIMULATE automatically processing all messages (queue transaction wi
                         }
                         else
                         {
-                            var answer = PromptChar(new[] { 'y', 'n' }, "Would you like to move {0} to {1}? (y/n)",
-                                                    message.Id, sourceQueue);
+                            msmqMessageQueue.Send(msmqMessageQueue.InputQueueAddress,
+                                                  transportMessageToSend,
+                                                  transactionContext);
 
-                            if (answer == 'y')
-                            {
-                                msmqMessageQueue.Send(sourceQueue, transportMessageToSend, transactionContext);
-
-                                Print("Moved {0} to {1}", message.Id, sourceQueue);
-                            }
-                            else
-                            {
-                                msmqMessageQueue.Send(msmqMessageQueue.InputQueueAddress,
-                                                      transportMessageToSend,
-                                                      transactionContext);
-
-                                Print("Moved {0} to {1}", message.Id, msmqMessageQueue.InputQueueAddress);
-                            }
+                            Print("Moved {0} to {1}", message.Id, msmqMessageQueue.InputQueueAddress);
                         }
                     }
-                    catch (NiceException e)
-                    {
-                        Print(e.Message);
-
-                        msmqMessageQueue.Send(msmqMessageQueue.InputQueueAddress,
-                                              transportMessageToSend,
-                                              transactionContext);
-                    }
                 }
-
-                if (parameters.DryRun.GetValueOrDefault())
+                catch (NiceException e)
                 {
-                    Print("Aborting queue transaction");
-                    return;
+                    Print(e.Message);
+
+                    msmqMessageQueue.Send(msmqMessageQueue.InputQueueAddress,
+                                          transportMessageToSend,
+                                          transactionContext);
                 }
-                
-                if (!parameters.Interactive)
-                {
-                    tx.Complete();
-                    return;
-                }
-
-                var commitAnswer = PromptChar(new[] {'y', 'n'}, "Would you like to commit the queue transaction?");
-
-                if (commitAnswer == 'y')
-                {
-                    Print("Committing queue transaction");
-
-                    tx.Complete();
-                    return;
-                }
-
-                Print("Queue transaction aborted");
             }
         }
 
-        static List<ReceivedTransportMessage> GetAllTheMessages(MsmqMessageQueue msmqMessageQueue, ITransactionContext transactionContext)
+        static List<ReceivedTransportMessage> GetMessages(MsmqMessageQueue msmqMessageQueue, ITransactionContext transactionContext)
         {
             var messages = new List<ReceivedTransportMessage>();
             ReceivedTransportMessage transportMessage;
-
-            while ((transportMessage = msmqMessageQueue.ReceiveMessage(transactionContext)) != null)
+            var count = 0;
+            while (count++ < BatchSize
+                    && (transportMessage = msmqMessageQueue.ReceiveMessage(transactionContext)) != null)
             {
+                Console.Write("\rReading message {0}", count);
                 messages.Add(transportMessage);
+            }
+
+            Console.WriteLine();
+
+            if (messages.Count >= BatchSize)
+            {
+                Console.WriteLine("Read max batch number ({0}) of messages", BatchSize);
             }
 
             return messages;
